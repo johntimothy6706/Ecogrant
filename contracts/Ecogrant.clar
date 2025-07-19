@@ -10,12 +10,20 @@
 (define-constant ERR_INVALID_AMOUNT (err u108))
 (define-constant ERR_INVALID_DURATION (err u109))
 (define-constant ERR_NOT_MEMBER (err u110))
+(define-constant ERR_REPORT_NOT_FOUND (err u111))
+(define-constant ERR_ALREADY_REPORTED (err u112))
+(define-constant ERR_INVALID_IMPACT_SCORE (err u113))
+(define-constant ERR_REPORT_PERIOD_ENDED (err u114))
+(define-constant ERR_NOT_GRANT_RECIPIENT (err u115))
+(define-constant ERR_INVALID_VERIFICATION (err u116))
 
 (define-data-var total-proposals uint u0)
 (define-data-var treasury-balance uint u0)
 (define-data-var min-voting-power uint u1000000)
 (define-data-var voting-duration uint u144)
 (define-data-var quorum-threshold uint u51)
+(define-data-var total-impact-reports uint u0)
+(define-data-var report-submission-period uint u1008)
 
 (define-map dao-members principal uint)
 (define-map proposals uint {
@@ -35,6 +43,32 @@
 })
 (define-map votes {proposal-id: uint, voter: principal} {vote: bool, power: uint})
 (define-map member-voting-power principal uint)
+(define-map impact-reports uint {
+    report-id: uint,
+    proposal-id: uint,
+    recipient: principal,
+    submitted-at: uint,
+    impact-score: uint,
+    evidence-hash: (string-ascii 64),
+    verified: bool,
+    verifier: (optional principal),
+    carbon-offset: uint,
+    beneficiaries-count: uint,
+    project-status: (string-ascii 20)
+})
+(define-map recipient-reputation principal {
+    total-grants: uint,
+    completed-projects: uint,
+    total-impact-score: uint,
+    average-impact: uint,
+    reliability-score: uint,
+    last-updated: uint
+})
+(define-map grant-tracking {proposal-id: uint} {
+    report-deadline: uint,
+    report-submitted: bool,
+    final-impact-score: uint
+})
 
 (define-private (is-dao-member (user principal))
     (is-some (map-get? dao-members user))
@@ -76,6 +110,74 @@
             (meets-quorum proposal-id)
             (> (get votes-for proposal) (get votes-against proposal))
         )
+    )
+)
+
+(define-private (is-report-period-active (proposal-id uint))
+    (let (
+        (tracking (map-get? grant-tracking {proposal-id: proposal-id}))
+    )
+        (match tracking
+            some-tracking (< stacks-block-height (get report-deadline some-tracking))
+            false
+        )
+    )
+)
+
+(define-private (calculate-reliability-score (recipient principal))
+    (let (
+        (reputation (default-to {
+            total-grants: u0,
+            completed-projects: u0,
+            total-impact-score: u0,
+            average-impact: u0,
+            reliability-score: u0,
+            last-updated: u0
+        } (map-get? recipient-reputation recipient)))
+        (total-grants (get total-grants reputation))
+        (completed-projects (get completed-projects reputation))
+    )
+        (if (> total-grants u0)
+            (/ (* completed-projects u100) total-grants)
+            u0
+        )
+    )
+)
+
+(define-private (update-recipient-reputation 
+    (recipient principal) 
+    (impact-score uint) 
+    (project-completed bool)
+)
+    (let (
+        (current-reputation (default-to {
+            total-grants: u0,
+            completed-projects: u0,
+            total-impact-score: u0,
+            average-impact: u0,
+            reliability-score: u0,
+            last-updated: u0
+        } (map-get? recipient-reputation recipient)))
+        (new-total-grants (+ (get total-grants current-reputation) u1))
+        (new-completed (if project-completed 
+            (+ (get completed-projects current-reputation) u1)
+            (get completed-projects current-reputation)
+        ))
+        (new-total-impact (+ (get total-impact-score current-reputation) impact-score))
+        (new-average-impact (if (> new-total-grants u0) 
+            (/ new-total-impact new-total-grants) 
+            u0
+        ))
+        (new-reliability (calculate-reliability-score recipient))
+    )
+        (map-set recipient-reputation recipient {
+            total-grants: new-total-grants,
+            completed-projects: new-completed,
+            total-impact-score: new-total-impact,
+            average-impact: new-average-impact,
+            reliability-score: new-reliability,
+            last-updated: stacks-block-height
+        })
     )
 )
 
@@ -180,6 +282,11 @@
                 (begin
                     (try! (as-contract (stx-transfer? proposal-amount tx-sender proposal-recipient)))
                     (var-set treasury-balance (- treasury proposal-amount))
+                    (map-set grant-tracking {proposal-id: proposal-id} {
+                        report-deadline: (+ stacks-block-height (var-get report-submission-period)),
+                        report-submitted: false,
+                        final-impact-score: u0
+                    })
                     (ok true)
                 )
                 (ok false)
@@ -221,6 +328,82 @@
         (asserts! (<= amount treasury) ERR_INSUFFICIENT_FUNDS)
         (try! (as-contract (stx-transfer? amount tx-sender CONTRACT_OWNER)))
         (var-set treasury-balance (- treasury amount))
+        (ok true)
+    )
+)
+
+(define-public (submit-impact-report 
+    (proposal-id uint)
+    (impact-score uint)
+    (evidence-hash (string-ascii 64))
+    (carbon-offset uint)
+    (beneficiaries-count uint)
+    (project-status (string-ascii 20))
+)
+    (let (
+        (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+        (tracking (unwrap! (map-get? grant-tracking {proposal-id: proposal-id}) ERR_PROPOSAL_NOT_FOUND))
+        (report-id (+ (var-get total-impact-reports) u1))
+        (recipient (get recipient proposal))
+    )
+        (asserts! (is-eq tx-sender recipient) ERR_NOT_GRANT_RECIPIENT)
+        (asserts! (not (get report-submitted tracking)) ERR_ALREADY_REPORTED)
+        (asserts! (is-report-period-active proposal-id) ERR_REPORT_PERIOD_ENDED)
+        (asserts! (and (>= impact-score u0) (<= impact-score u100)) ERR_INVALID_IMPACT_SCORE)
+        
+        (map-set impact-reports report-id {
+            report-id: report-id,
+            proposal-id: proposal-id,
+            recipient: recipient,
+            submitted-at: stacks-block-height,
+            impact-score: impact-score,
+            evidence-hash: evidence-hash,
+            verified: false,
+            verifier: none,
+            carbon-offset: carbon-offset,
+            beneficiaries-count: beneficiaries-count,
+            project-status: project-status
+        })
+        
+        (map-set grant-tracking {proposal-id: proposal-id} (merge tracking {
+            report-submitted: true,
+            final-impact-score: impact-score
+        }))
+        
+        (update-recipient-reputation recipient impact-score true)
+        (var-set total-impact-reports report-id)
+        (ok report-id)
+    )
+)
+
+(define-public (verify-impact-report (report-id uint) (verified bool))
+    (let (
+        (report (unwrap! (map-get? impact-reports report-id) ERR_REPORT_NOT_FOUND))
+        (proposal-id (get proposal-id report))
+    )
+        (asserts! (is-dao-member tx-sender) ERR_NOT_MEMBER)
+        (asserts! (not (get verified report)) ERR_INVALID_VERIFICATION)
+        
+        (map-set impact-reports report-id (merge report {
+            verified: verified,
+            verifier: (some tx-sender)
+        }))
+        
+        (if verified
+            (ok true)
+            (begin
+                (update-recipient-reputation (get recipient report) u0 false)
+                (ok false)
+            )
+        )
+    )
+)
+
+(define-public (update-report-submission-period (new-period uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> new-period u0) ERR_INVALID_DURATION)
+        (var-set report-submission-period new-period)
         (ok true)
     )
 )
@@ -279,5 +462,56 @@
                 )
             )
         (err "not-found")
+    )
+)
+
+(define-read-only (get-impact-report (report-id uint))
+    (map-get? impact-reports report-id)
+)
+
+(define-read-only (get-recipient-reputation (recipient principal))
+    (map-get? recipient-reputation recipient)
+)
+
+(define-read-only (get-grant-tracking (proposal-id uint))
+    (map-get? grant-tracking {proposal-id: proposal-id})
+)
+
+(define-read-only (get-total-impact-reports)
+    (var-get total-impact-reports)
+)
+
+(define-read-only (get-report-submission-period)
+    (var-get report-submission-period)
+)
+
+(define-read-only (is-report-deadline-active (proposal-id uint))
+    (is-report-period-active proposal-id)
+)
+
+(define-read-only (calculate-recipient-reliability (recipient principal))
+    (calculate-reliability-score recipient)
+)
+
+(define-read-only (get-recipient-impact-summary (recipient principal))
+    (let (
+        (reputation (map-get? recipient-reputation recipient))
+    )
+        (match reputation
+            some-rep {
+                total-grants: (get total-grants some-rep),
+                completed-projects: (get completed-projects some-rep),
+                average-impact: (get average-impact some-rep),
+                reliability-percentage: (calculate-reliability-score recipient),
+                last-updated: (get last-updated some-rep)
+            }
+            {
+                total-grants: u0,
+                completed-projects: u0,
+                average-impact: u0,
+                reliability-percentage: u0,
+                last-updated: u0
+            }
+        )
     )
 )
