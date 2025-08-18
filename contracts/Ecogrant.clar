@@ -16,6 +16,13 @@
 (define-constant ERR_REPORT_PERIOD_ENDED (err u114))
 (define-constant ERR_NOT_GRANT_RECIPIENT (err u115))
 (define-constant ERR_INVALID_VERIFICATION (err u116))
+(define-constant ERR_INVALID_COLLABORATION (err u117))
+(define-constant ERR_NOT_COLLABORATOR (err u118))
+(define-constant ERR_COLLABORATION_NOT_FOUND (err u119))
+(define-constant ERR_INVALID_FUND_SPLIT (err u120))
+(define-constant ERR_ALREADY_ACCEPTED (err u121))
+(define-constant ERR_COLLABORATION_FINALIZED (err u122))
+(define-constant ERR_PENDING_COLLABORATORS (err u123))
 
 (define-data-var total-proposals uint u0)
 (define-data-var treasury-balance uint u0)
@@ -24,6 +31,7 @@
 (define-data-var quorum-threshold uint u51)
 (define-data-var total-impact-reports uint u0)
 (define-data-var report-submission-period uint u1008)
+(define-data-var total-collaborations uint u0)
 
 (define-map dao-members principal uint)
 (define-map proposals uint {
@@ -68,6 +76,28 @@
     report-deadline: uint,
     report-submitted: bool,
     final-impact-score: uint
+})
+(define-map collaborations uint {
+    collaboration-id: uint,
+    proposal-id: (optional uint),
+    lead-organization: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    total-amount: uint,
+    category: (string-ascii 50),
+    created-at: uint,
+    finalized: bool,
+    executed: bool
+})
+(define-map collaboration-members {collaboration-id: uint, member: principal} {
+    fund-percentage: uint,
+    role: (string-ascii 50),
+    accepted: bool,
+    funds-claimed: bool
+})
+(define-map collaboration-member-list {collaboration-id: uint} {
+    members: (list 10 principal),
+    member-count: uint
 })
 
 (define-private (is-dao-member (user principal))
@@ -179,6 +209,68 @@
             last-updated: stacks-block-height
         })
     )
+)
+
+(define-private (is-collaboration-member (collaboration-id uint) (member principal))
+    (is-some (map-get? collaboration-members {collaboration-id: collaboration-id, member: member}))
+)
+
+(define-private (calculate-total-percentages (collaboration-id uint))
+    (let (
+        (member-list (default-to {members: (list), member-count: u0} 
+            (map-get? collaboration-member-list {collaboration-id: collaboration-id})))
+        (members (get members member-list))
+    )
+        (fold calculate-member-percentage members u0)
+    )
+)
+
+(define-private (calculate-member-percentage (member principal) (total uint))
+    (let (
+        (collaboration-id u1)
+        (member-data (map-get? collaboration-members {collaboration-id: collaboration-id, member: member}))
+    )
+        (match member-data
+            some-data (+ total (get fund-percentage some-data))
+            total
+        )
+    )
+)
+
+(define-private (all-members-accepted (collaboration-id uint))
+    (let (
+        (member-list (default-to {members: (list), member-count: u0} 
+            (map-get? collaboration-member-list {collaboration-id: collaboration-id})))
+        (members (get members member-list))
+    )
+        (fold check-member-acceptance members true)
+    )
+)
+
+(define-private (check-member-acceptance (member principal) (all-accepted bool))
+    (let (
+        (collaboration-id u1)
+        (member-data (map-get? collaboration-members {collaboration-id: collaboration-id, member: member}))
+    )
+        (match member-data
+            some-data (and all-accepted (get accepted some-data))
+            false
+        )
+    )
+)
+
+(define-private (setup-collaboration-members 
+    (collaboration-id uint) 
+    (collaborators (list 10 principal)) 
+    (fund-percentages (list 10 uint)) 
+    (roles (list 10 (string-ascii 50)))
+    (index uint)
+)
+    (ok true)
+)
+
+(define-private (distribute-funds-to-members (collaboration-id uint))
+    (ok true)
 )
 
 (define-public (join-dao (voting-power uint))
@@ -408,6 +500,168 @@
     )
 )
 
+(define-public (create-collaboration 
+    (title (string-ascii 100))
+    (description (string-ascii 500))
+    (total-amount uint)
+    (category (string-ascii 50))
+    (collaborators (list 10 principal))
+    (fund-percentages (list 10 uint))
+    (roles (list 10 (string-ascii 50)))
+)
+    (let (
+        (collaboration-id (+ (var-get total-collaborations) u1))
+        (collaborator-count (len collaborators))
+        (percentage-count (len fund-percentages))
+        (role-count (len roles))
+    )
+        (asserts! (is-dao-member tx-sender) ERR_NOT_MEMBER)
+        (asserts! (> total-amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (<= total-amount (var-get treasury-balance)) ERR_INSUFFICIENT_FUNDS)
+        (asserts! (and (> collaborator-count u0) (<= collaborator-count u10)) ERR_INVALID_COLLABORATION)
+        (asserts! (is-eq collaborator-count percentage-count) ERR_INVALID_FUND_SPLIT)
+        (asserts! (is-eq collaborator-count role-count) ERR_INVALID_COLLABORATION)
+        
+        (map-set collaborations collaboration-id {
+            collaboration-id: collaboration-id,
+            proposal-id: none,
+            lead-organization: tx-sender,
+            title: title,
+            description: description,
+            total-amount: total-amount,
+            category: category,
+            created-at: stacks-block-height,
+            finalized: false,
+            executed: false
+        })
+        
+        (map-set collaboration-member-list {collaboration-id: collaboration-id} {
+            members: collaborators,
+            member-count: collaborator-count
+        })
+        
+
+        (var-set total-collaborations collaboration-id)
+        (ok collaboration-id)
+    )
+)
+
+(define-public (add-collaboration-member 
+    (collaboration-id uint) 
+    (member principal) 
+    (fund-percentage uint) 
+    (role (string-ascii 50))
+)
+    (let (
+        (collaboration (unwrap! (map-get? collaborations collaboration-id) ERR_COLLABORATION_NOT_FOUND))
+    )
+        (asserts! (is-eq tx-sender (get lead-organization collaboration)) ERR_UNAUTHORIZED)
+        (asserts! (not (get finalized collaboration)) ERR_COLLABORATION_FINALIZED)
+        (asserts! (not (is-collaboration-member collaboration-id member)) ERR_ALREADY_ACCEPTED)
+        
+        (map-set collaboration-members {collaboration-id: collaboration-id, member: member} {
+            fund-percentage: fund-percentage,
+            role: role,
+            accepted: false,
+            funds-claimed: false
+        })
+        (ok true)
+    )
+)
+
+(define-public (accept-collaboration (collaboration-id uint))
+    (let (
+        (collaboration (unwrap! (map-get? collaborations collaboration-id) ERR_COLLABORATION_NOT_FOUND))
+        (member-data (unwrap! (map-get? collaboration-members {collaboration-id: collaboration-id, member: tx-sender}) ERR_NOT_COLLABORATOR))
+    )
+        (asserts! (not (get finalized collaboration)) ERR_COLLABORATION_FINALIZED)
+        (asserts! (not (get accepted member-data)) ERR_ALREADY_ACCEPTED)
+        
+        (map-set collaboration-members {collaboration-id: collaboration-id, member: tx-sender} 
+            (merge member-data {accepted: true}))
+        (ok true)
+    )
+)
+
+(define-public (finalize-collaboration (collaboration-id uint))
+    (let (
+        (collaboration (unwrap! (map-get? collaborations collaboration-id) ERR_COLLABORATION_NOT_FOUND))
+    )
+        (asserts! (is-eq tx-sender (get lead-organization collaboration)) ERR_UNAUTHORIZED)
+        (asserts! (not (get finalized collaboration)) ERR_COLLABORATION_FINALIZED)
+        (asserts! (all-members-accepted collaboration-id) ERR_PENDING_COLLABORATORS)
+        (asserts! (is-eq (calculate-total-percentages collaboration-id) u100) ERR_INVALID_FUND_SPLIT)
+        
+        (map-set collaborations collaboration-id (merge collaboration {finalized: true}))
+        (ok true)
+    )
+)
+
+(define-public (submit-collaborative-proposal (collaboration-id uint))
+    (let (
+        (collaboration (unwrap! (map-get? collaborations collaboration-id) ERR_COLLABORATION_NOT_FOUND))
+        (proposal-id (+ (var-get total-proposals) u1))
+        (voting-ends (+ stacks-block-height (var-get voting-duration)))
+    )
+        (asserts! (is-eq tx-sender (get lead-organization collaboration)) ERR_UNAUTHORIZED)
+        (asserts! (get finalized collaboration) ERR_INVALID_COLLABORATION)
+        (asserts! (not (get executed collaboration)) ERR_PROPOSAL_ALREADY_EXECUTED)
+        
+        (map-set proposals proposal-id {
+            id: proposal-id,
+            proposer: tx-sender,
+            title: (get title collaboration),
+            description: (get description collaboration),
+            recipient: tx-sender,
+            amount: (get total-amount collaboration),
+            category: (get category collaboration),
+            created-at: stacks-block-height,
+            voting-ends-at: voting-ends,
+            votes-for: u0,
+            votes-against: u0,
+            executed: false,
+            passed: false
+        })
+        
+        (map-set collaborations collaboration-id (merge collaboration {proposal-id: (some proposal-id)}))
+        (var-set total-proposals proposal-id)
+        (ok proposal-id)
+    )
+)
+
+(define-public (distribute-collaboration-funds (collaboration-id uint))
+    (let (
+        (collaboration (unwrap! (map-get? collaborations collaboration-id) ERR_COLLABORATION_NOT_FOUND))
+        (proposal-id (unwrap! (get proposal-id collaboration) ERR_PROPOSAL_NOT_FOUND))
+        (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+    )
+        (asserts! (get executed proposal) ERR_VOTING_NOT_ENDED)
+        (asserts! (get passed proposal) ERR_INVALID_PROPOSAL)
+        (asserts! (not (get executed collaboration)) ERR_PROPOSAL_ALREADY_EXECUTED)
+        
+        (map-set collaborations collaboration-id (merge collaboration {executed: true}))
+        (distribute-funds-to-members collaboration-id)
+    )
+)
+
+(define-public (claim-collaboration-funds (collaboration-id uint))
+    (let (
+        (collaboration (unwrap! (map-get? collaborations collaboration-id) ERR_COLLABORATION_NOT_FOUND))
+        (member-data (unwrap! (map-get? collaboration-members {collaboration-id: collaboration-id, member: tx-sender}) ERR_NOT_COLLABORATOR))
+        (total-amount (get total-amount collaboration))
+        (fund-percentage (get fund-percentage member-data))
+        (member-amount (/ (* total-amount fund-percentage) u100))
+    )
+        (asserts! (get executed collaboration) ERR_VOTING_NOT_ENDED)
+        (asserts! (not (get funds-claimed member-data)) ERR_ALREADY_ACCEPTED)
+        
+        (try! (as-contract (stx-transfer? member-amount tx-sender tx-sender)))
+        (map-set collaboration-members {collaboration-id: collaboration-id, member: tx-sender}
+            (merge member-data {funds-claimed: true}))
+        (ok member-amount)
+    )
+)
+
 (define-read-only (get-proposal (proposal-id uint))
     (map-get? proposals proposal-id)
 )
@@ -515,3 +769,50 @@
         )
     )
 )
+
+(define-read-only (get-collaboration (collaboration-id uint))
+    (map-get? collaborations collaboration-id)
+)
+
+(define-read-only (get-collaboration-member (collaboration-id uint) (member principal))
+    (map-get? collaboration-members {collaboration-id: collaboration-id, member: member})
+)
+
+(define-read-only (get-collaboration-members (collaboration-id uint))
+    (map-get? collaboration-member-list {collaboration-id: collaboration-id})
+)
+
+(define-read-only (get-total-collaborations)
+    (var-get total-collaborations)
+)
+
+(define-read-only (is-collaboration-ready (collaboration-id uint))
+    (let (
+        (collaboration (map-get? collaborations collaboration-id))
+    )
+        (match collaboration
+            some-collab (and
+                (get finalized some-collab)
+                (all-members-accepted collaboration-id)
+            )
+            false
+        )
+    )
+)
+
+(define-read-only (get-collaboration-fund-split (collaboration-id uint))
+    (let (
+        (member-list (default-to {members: (list), member-count: u0} 
+            (map-get? collaboration-member-list {collaboration-id: collaboration-id})))
+        (members (get members member-list))
+    )
+        {
+            total-percentage: (calculate-total-percentages collaboration-id),
+            members: members,
+            member-count: (get member-count member-list)
+        }
+    )
+)
+
+
+
